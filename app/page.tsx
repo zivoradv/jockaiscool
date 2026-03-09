@@ -18,6 +18,8 @@ export default function Page() {
 
   const goBack = () => setGame(null)
 
+  console.log(game)
+
   if (game === "word-race")
     return <WordRace pid={SESSION_PID} onBack={goBack} />
   if (game === "wordle") return <Wordle pid={SESSION_PID} onBack={goBack} />
