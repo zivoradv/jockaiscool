@@ -10,100 +10,7 @@ import type {
   WordleGuessRow,
   TileColor,
 } from "@/types/game"
-
-// ── Word lists ─────────────────────────────────────────────────────────────
-const WORDS = [
-  "CRANE",
-  "SLATE",
-  "AUDIO",
-  "SHOUT",
-  "LIGHT",
-  "DREAM",
-  "PIANO",
-  "GRACE",
-  "BRAVE",
-  "FLAME",
-  "HEART",
-  "BLOOM",
-  "STONE",
-  "DANCE",
-  "LUNAR",
-  "MAGIC",
-  "NORTH",
-  "OCEAN",
-  "PEACE",
-  "RIVER",
-  "SHINE",
-  "TIGER",
-  "ANGEL",
-  "BLAZE",
-  "CLOUD",
-  "DRIVE",
-  "EARTH",
-  "FROST",
-  "GHOST",
-  "HAVEN",
-  "IVORY",
-  "JEWEL",
-  "LEMON",
-  "MAPLE",
-  "NIGHT",
-  "ORBIT",
-  "PRIDE",
-  "REALM",
-  "SOLAR",
-  "TOWER",
-  "UNITY",
-  "VAPOR",
-  "AZURE",
-  "BRUSH",
-  "CHESS",
-  "DAISY",
-  "EMBER",
-  "FABLE",
-  "GLOBE",
-  "HASTE",
-  "KARMA",
-  "LASER",
-  "METRO",
-  "NERVE",
-  "OLIVE",
-  "PLAZA",
-  "QUIRK",
-  "RAVEN",
-  "SUGAR",
-  "THORN",
-  "VIOLA",
-  "ALBUM",
-  "BENCH",
-  "CANDY",
-  "DEPOT",
-  "ELBOW",
-  "FLAIR",
-  "MONEY",
-  "NOVEL",
-  "OUTER",
-  "PILOT",
-  "RELAY",
-  "SALSA",
-  "TOAST",
-  "VISIT",
-  "BLEND",
-  "CRISP",
-  "EVOKE",
-  "FLUTE",
-  "GRIND",
-  "HONEY",
-  "IRONY",
-  "JOKER",
-  "KNACK",
-  "LUCKY",
-  "MANGO",
-  "NURSE",
-  "OXIDE",
-  "PASTA",
-  "QUOTA",
-]
+import { WORDS } from "@/lib/wordList"
 
 const VALID_WORDS = new Set(WORDS)
 
@@ -174,6 +81,12 @@ export default function Wordle({ pid, onBack }: Props) {
   roomRef2.current = room
   boardRef2.current = board
 
+  useEffect(() => {
+    if (screen !== "playing") return
+    setBoard({ guesses: [], solved: false, failed: false })
+    setCurrentGuess("")
+  }, [screen, room?.round]) // room?.round ensures it resets each new round
+
   // ── Listen to room ───────────────────────────────────────────────────────
   useEffect(() => {
     if (!code) return
@@ -184,7 +97,7 @@ export default function Wordle({ pid, onBack }: Props) {
       setRoom(data)
       roomRef2.current = data
       setScreen((prev) => {
-        if (data.status === "lobby" && prev === "landing") return "playing"
+        if (data.status === "lobby" && prev === "landing") return "lobby"
         if (
           data.status === "playing" &&
           (prev === "lobby" || prev === "result")
@@ -284,10 +197,44 @@ export default function Wordle({ pid, onBack }: Props) {
     setLoading(false)
   }
 
+  async function resolveRound(
+    r: WordleRoom,
+    c: string,
+    hostId: string,
+    myGuessCount: number,
+    iSolved: boolean,
+    done: Record<string, boolean>,
+    solvedIn: Record<string, number>
+  ) {
+    const other = r.players.find((p) => p.id !== hostId)
+    const myIn = solvedIn[hostId] ?? -1
+    const otherIn = other ? solvedIn[other.id] ?? -1 : -1
+
+    let winner: string | null = null
+    if (myIn !== -1 && otherIn !== -1)
+      winner = myIn <= otherIn ? hostId : other!.id
+    else if (myIn !== -1) winner = hostId
+    else if (otherIn !== -1) winner = other!.id
+
+    const newScores = { ...r.scores }
+    if (winner) newScores[winner] = (newScores[winner] || 0) + 1
+
+    await set(ref(db, `wl-rooms/${c}`), {
+      ...r,
+      status: "result",
+      roundWinner: winner,
+      scores: newScores,
+      done,
+      solvedIn,
+    })
+  }
+
   // ── Submit a guess ────────────────────────────────────────────────────────
   const submitGuess = useCallback(async () => {
+    console.log("cao")
     const r = roomRef2.current
     const b = boardRef2.current
+    console.log("status: ", r?.status)
     if (!r || r.status !== "playing" || b.solved || b.failed) return
     const g = currentGuess.toUpperCase()
     if (g.length !== 5) {
@@ -315,71 +262,53 @@ export default function Wordle({ pid, onBack }: Props) {
     const c = codeRef.current
     await set(boardRef(c, pid), newBoard)
 
+    // In submitGuess, after marking yourself done:
     if (solved || failed) {
-      // Mark self as done
       const newDone = { ...r.done, [pid]: true }
       const newSolvedIn = {
         ...r.solvedIn,
         [pid]: solved ? newGuesses.length : -1,
       }
 
-      // Check if both done
-      const other = r.players.find((p) => p.id !== pid)
-      const bothDone = other ? !!newDone[other.id] : true
+      await set(roomRef(c), { ...r, done: newDone, solvedIn: newSolvedIn })
 
-      if (bothDone || solved) {
-        // Resolve round
-        let winner: string | null = null
-        if (solved) {
-          const otherSolvedIn = other ? newSolvedIn[other.id] ?? -1 : -1
-          if (otherSolvedIn === -1) winner = pid
-          else if (newGuesses.length <= otherSolvedIn) winner = pid
-          else winner = other?.id ?? null
-        } else if (other && newDone[other.id]) {
-          const oS = newSolvedIn[other.id] ?? -1
-          if (oS !== -1) winner = other.id
+      // Only host resolves the round
+      if (pid === r.host) {
+        const other = r.players.find((p) => p.id !== pid)
+        const bothDone = other ? !!newDone[other.id] : true
+
+        if (bothDone || solved) {
+          resolveRound(
+            r,
+            c,
+            pid,
+            newGuesses.length,
+            solved,
+            newDone,
+            newSolvedIn
+          )
+        } else {
+          // Poll until other player is done
+          const poll = setInterval(async () => {
+            const snap = await get(roomRef(c))
+            if (!snap.exists()) return clearInterval(poll)
+            const rr = snap.val() as WordleRoom
+            if (rr.status !== "playing") return clearInterval(poll)
+            const oDone = other ? rr.done?.[other.id] : true
+            if (oDone) {
+              clearInterval(poll)
+              resolveRound(
+                rr,
+                c,
+                pid,
+                newGuesses.length,
+                solved,
+                rr.done,
+                rr.solvedIn
+              )
+            }
+          }, 1000)
         }
-        const newScores = { ...r.scores }
-        if (winner) newScores[winner] = (newScores[winner] || 0) + 1
-        await set(roomRef(c), {
-          ...r,
-          status: "result",
-          roundWinner: winner,
-          scores: newScores,
-          done: newDone,
-          solvedIn: newSolvedIn,
-        })
-      } else {
-        // Wait for other player
-        await set(roomRef(c), { ...r, done: newDone, solvedIn: newSolvedIn })
-        // Poll for other player to finish
-        const poll = setInterval(async () => {
-          const snap = await get(roomRef(c))
-          if (!snap.exists()) {
-            clearInterval(poll)
-            return
-          }
-          const rr = snap.val() as WordleRoom
-          if (rr.status !== "playing") {
-            clearInterval(poll)
-            return
-          }
-          const oDone = other ? rr.done?.[other.id] : true
-          if (oDone) {
-            clearInterval(poll)
-            let w: string | null = null
-            const oS = other ? rr.solvedIn?.[other.id] ?? -1 : -1
-            if (oS !== -1) w = other?.id ?? null
-            const ns = { ...rr.scores }
-            if (w) ns[w] = (ns[w] || 0) + 1
-            await set(roomRef(c), {
-              ...rr,
-              status: "result",
-              roundWinner: w,
-              scores: ns,
-            })
-          }
-        }, 1200)
       }
     }
   }, [currentGuess, pid])
